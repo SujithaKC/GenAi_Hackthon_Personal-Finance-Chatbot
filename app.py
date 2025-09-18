@@ -2,11 +2,12 @@ import streamlit as st
 import sqlite3
 import datetime
 from sentence_transformers import SentenceTransformer, util
-import torch  # needed for tensors
+import torch
 import pandas as pd
+import subprocess
 
 # --------------------------
-# Setup embedding model
+# Load Granite Embedding Model
 # --------------------------
 @st.cache_resource
 def load_embed_model():
@@ -14,44 +15,31 @@ def load_embed_model():
 
 embed_model = load_embed_model()
 
-# Pre-defined example messages for intent detection
-intent_examples = {
-    "add income": [
-        "I earned 5000",
-        "My salary is 10000",
-        "I got paid today",
-        "Received payment"
-    ],
-    "add expense": [
-        "I spent 200 on food",
-        "Bought groceries for 500",
-        "Paid rent 3000",
-        "I gave 100 to my friend"
-    ],
-    "show summary": [
-        "What is my balance?",
-        "Show my summary",
-        "How much left",
-        "What are my expenses?"
-    ]
-}
+# --------------------------
+# Ollama Granite Local Model
+# --------------------------
+def get_granite_answer(prompt: str, system_message: str = None) -> str:
+    if system_message is None:
+        system_message = "You are a helpful, concise financial advisor. Provide practical advice about personal finance, budgeting, saving, and investing."
 
-# Precompute embeddings for examples
-example_embeddings = {}
-for intent, texts in intent_examples.items():
-    example_embeddings[intent] = embed_model.encode(texts, convert_to_tensor=True)
+    full_prompt = f"System: {system_message}\nUser: {prompt}\nAssistant:"
 
-def classify_intent(msg: str):
-    msg_emb = embed_model.encode(msg, convert_to_tensor=True)
-    scores = {}
-    for intent, ex_embs in example_embeddings.items():
-        sims = util.cos_sim(msg_emb, ex_embs)
-        scores[intent] = float(torch.max(sims).cpu().numpy())
-    best_intent = max(scores, key=lambda x: scores[x])
-    return best_intent, scores[best_intent]
+    try:
+        result = subprocess.run(
+            ["ollama", "run", "granite3.1-moe:3b", full_prompt],
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+        else:
+            return f"❌ Ollama Error: {result.stderr.strip()}"
+    except Exception as e:
+        return f"❌ Unexpected error: {str(e)}"
 
 # --------------------------
-# DB + finance functions
+# DB Functions
 # --------------------------
 def init_db():
     conn = sqlite3.connect("finance.db")
@@ -74,7 +62,7 @@ def add_transaction(t_type, amount, category="General", description=""):
     c = conn.cursor()
     c.execute(
         "INSERT INTO transactions (type, amount, category, description, date) VALUES (?, ?, ?, ?, ?)",
-        (t_type, amount, category, description, datetime.date.today().isoformat())
+        (t_type, amount, category, description, datetime.date.today().isoformat()),
     )
     conn.commit()
     conn.close()
@@ -84,7 +72,7 @@ def edit_transaction(t_id, t_type, amount, category, description):
     c = conn.cursor()
     c.execute(
         "UPDATE transactions SET type=?, amount=?, category=?, description=? WHERE id=?",
-        (t_type, amount, category, description, t_id)
+        (t_type, amount, category, description, t_id),
     )
     conn.commit()
     conn.close()
@@ -115,14 +103,97 @@ def get_transactions():
     return rows
 
 # --------------------------
-# Streamlit app
+# Personalized Financial Advice
 # --------------------------
-st.set_page_config(page_title="💸 Personal Finance Chatbot (Granite)", layout="wide")
-st.title("💸 Personal Finance Bot (using IBM Granite embeddings)")
+def get_personalized_saving_tips():
+    income, expenses, remaining = get_summary()
+    savings_rate = (remaining / income * 100) if income > 0 else 0
+    prompt = f"""
+    User's Financial Summary:
+    - Monthly Income: ₹{income}
+    - Monthly Expenses: ₹{expenses}
+    - Monthly Savings: ₹{remaining}
+    - Savings Rate: {savings_rate:.1f}%
 
-tab1, tab2 = st.tabs(["Chat & Manual Entry", "Transaction Records"])
+    Provide 3-4 specific, actionable saving tips tailored to this user's situation.
+    """
+    system_message = "You are an expert financial advisor specializing in personal savings strategies."
+    return get_granite_answer(prompt, system_message)
+
+def get_personalized_investment_tips():
+    income, expenses, remaining = get_summary()
+    transactions = get_transactions()
+    expense_categories = {}
+    for t in transactions:
+        if t[1] == "Expense":
+            cat = t[3]
+            amt = t[2]
+            expense_categories[cat] = expense_categories.get(cat, 0) + amt
+    top_expenses = sorted(expense_categories.items(), key=lambda x: x[1], reverse=True)[:3]
+    prompt = f"""
+    User's Financial Profile:
+    - Monthly Income: ₹{income}
+    - Monthly Expenses: ₹{expenses}
+    - Monthly Investable Amount: ₹{remaining}
+    - Top Expense Categories: {', '.join([f'{c} (₹{a})' for c,a in top_expenses]) if top_expenses else 'No data'}
+
+    Provide personalized investment advice considering income, spending, and investable funds.
+    """
+    system_message = "You are a certified investment advisor. Provide practical, personalized investment recommendations."
+    return get_granite_answer(prompt, system_message)
+
+def get_financial_health_analysis():
+    income, expenses, remaining = get_summary()
+    savings_rate = (remaining / income * 100) if income > 0 else 0
+    expense_ratio = (expenses / income * 100) if income > 0 else 100
+    prompt = f"""
+    User's Financial Health Metrics:
+    - Monthly Income: ₹{income}
+    - Monthly Expenses: ₹{expenses}
+    - Monthly Savings: ₹{remaining}
+    - Savings Rate: {savings_rate:.1f}%
+    - Expense-to-Income Ratio: {expense_ratio:.1f}%
+
+    Provide a comprehensive financial health analysis with actionable insights.
+    """
+    system_message = "You are a financial health analyst. Provide thorough, actionable insights."
+    return get_granite_answer(prompt, system_message)
+
+# --------------------------
+# Intent Detection
+# --------------------------
+intent_examples = {
+    "add income": ["I earned 5000", "My salary is 10000", "I got paid today"],
+    "add expense": ["I spent 200 on food", "Bought groceries for 500", "Paid rent 3000"],
+    "show summary": ["What is my balance?", "Show my summary", "How much left"],
+    "saving tips": ["give me saving tips", "how can I save more?", "help me save money"],
+    "investment tips": ["investment advice", "where should I invest?", "help me invest"],
+    "financial analysis": ["analyze my finances", "financial health check", "how am I doing financially?"],
+}
+
+example_embeddings = {
+    intent: embed_model.encode(texts, convert_to_tensor=True)
+    for intent, texts in intent_examples.items()
+}
+
+def classify_intent(msg: str):
+    msg_emb = embed_model.encode(msg, convert_to_tensor=True)
+    scores = {}
+    for intent, ex_embs in example_embeddings.items():
+        sims = util.cos_sim(msg_emb, ex_embs)
+        scores[intent] = float(torch.max(sims).cpu().numpy())
+    best_intent = max(scores, key=lambda x: scores[x])
+    return best_intent, scores[best_intent]
+
+# --------------------------
+# Streamlit UI
+# --------------------------
+st.set_page_config(page_title="💸 Personal Finance Chatbot", layout="wide")
+st.title("💸 Personal Finance Bot (Granite Local + Embeddings)")
 
 init_db()
+
+tab1, tab2, tab3 = st.tabs(["Chat & Manual Entry", "Transaction Records", "Financial Insights"])
 
 with tab1:
     st.subheader("Chat with Finance Bot")
@@ -131,33 +202,42 @@ with tab1:
     if st.button("Submit Chat"):
         if user_input.strip():
             intent, score = classify_intent(user_input)
-            st.write(f"Detected intent: **{intent}** (similarity {score:.3f})")
-
-            if intent == "add income":
-                amount = [float(s) for s in user_input.split() if s.replace('.','',1).isdigit()]
-                if amount:
-                    add_transaction("Income", amount[0], "General", user_input)
-                    st.success(f"✅ Added income: {amount[0]}")
-                else:
-                    st.warning("No numerical amount detected in message.")
-
-            elif intent == "add expense":
-                amount = [float(s) for s in user_input.split() if s.replace('.','',1).isdigit()]
-                category = "General"
-                if "for" in user_input.lower():
-                    category = user_input.lower().split("for")[-1].strip().split()[0]
-                if amount:
-                    add_transaction("Expense", amount[0], category, user_input)
-                    st.error(f"💸 Added expense: {category} - {amount[0]}")
-                else:
-                    st.warning("No numerical amount detected in message.")
-
-            elif intent == "show summary":
-                income, expenses, remaining = get_summary()
-                st.info(f"💰 Income: {income} | 📉 Expenses: {expenses} | 📊 Remaining: {remaining}")
-
+            if score > 0.6:
+                if intent == "add income":
+                    amt = [float(s) for s in user_input.split() if s.replace(".", "", 1).isdigit()]
+                    if amt:
+                        add_transaction("Income", amt[0], "General", user_input)
+                        st.success(f"✅ Added income: {amt[0]}")
+                elif intent == "add expense":
+                    amt = [float(s) for s in user_input.split() if s.replace(".", "", 1).isdigit()]
+                    cat = "General"
+                    if "for" in user_input.lower():
+                        cat = user_input.lower().split("for")[-1].strip().split()[0]
+                    if amt:
+                        add_transaction("Expense", amt[0], cat, user_input)
+                        st.error(f"💸 Added expense: {cat} - {amt[0]}")
+                elif intent == "show summary":
+                    income, expenses, remaining = get_summary()
+                    st.info(f"💰 Income: {income} | 📉 Expenses: {expenses} | 📊 Remaining: {remaining}")
+                elif intent == "saving tips":
+                    with st.spinner("Generating personalized saving tips..."):
+                        tips = get_personalized_saving_tips()
+                    st.success("💡 **Personalized Saving Tips:**")
+                    st.write(tips)
+                elif intent == "investment tips":
+                    with st.spinner("Generating investment recommendations..."):
+                        advice = get_personalized_investment_tips()
+                    st.success("📈 **Personalized Investment Advice:**")
+                    st.write(advice)
+                elif intent == "financial analysis":
+                    with st.spinner("Analyzing your financial health..."):
+                        analysis = get_financial_health_analysis()
+                    st.success("🔍 **Financial Health Analysis:**")
+                    st.write(analysis)
             else:
-                st.write("🤖 I didn't understand intent. Try simpler phrasing.")
+                with st.spinner("🤖 Thinking with Granite..."):
+                    response = get_granite_answer(user_input)
+                    st.write(response)
 
     st.subheader("Manual Entry")
     with st.form("manual"):
@@ -169,7 +249,7 @@ with tab1:
 
         if submitted:
             add_transaction(etype, amt, category or "General", description or "")
-            st.success(f"{etype} of {amt} added.")
+            st.success(f"{etype} of ₹{amt} added.")
 
 with tab2:
     st.subheader("Transaction Records")
@@ -193,7 +273,7 @@ with tab2:
             t_id, t_type, amount, category, description, date = record
 
             with st.form("edit_delete_form"):
-                new_type = st.selectbox("Type", ["Income", "Expense"], index=0 if t_type=="Income" else 1)
+                new_type = st.selectbox("Type", ["Income", "Expense"], index=0 if t_type == "Income" else 1)
                 new_amount = st.number_input("Amount", value=amount)
                 new_category = st.text_input("Category", value=category)
                 new_desc = st.text_input("Description", value=description)
@@ -212,3 +292,32 @@ with tab2:
                     st.warning("Transaction deleted. Refresh to see changes.")
     else:
         st.info("No transactions yet.")
+
+with tab3:
+    st.subheader("📊 Financial Insights Dashboard")
+    income, expenses, remaining = get_summary()
+
+    if income > 0:
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Savings Rate", f"{(remaining/income*100):.1f}%")
+        col2.metric("Expense Ratio", f"{(expenses/income*100):.1f}%")
+        col3.metric("Monthly Savings", f"₹{remaining}")
+
+        if st.button("🔄 Refresh Financial Insights", key="refresh_insights"):
+            with st.spinner("Generating comprehensive financial insights..."):
+                tips = get_personalized_saving_tips()
+                advice = get_personalized_investment_tips()
+                analysis = get_financial_health_analysis()
+
+                st.success("💡 **Personalized Saving Strategies:**")
+                st.write(tips)
+                st.divider()
+
+                st.success("📈 **Investment Recommendations:**")
+                st.write(advice)
+                st.divider()
+
+                st.success("🔍 **Comprehensive Financial Health Analysis:**")
+                st.write(analysis)
+    else:
+        st.warning("Add some income and expense data to get personalized financial insights!")
