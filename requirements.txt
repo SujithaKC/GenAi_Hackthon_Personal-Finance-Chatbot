@@ -1,0 +1,4 @@
+flask
+ibm-watsonx-ai
+sqlite-utils
+pandas
